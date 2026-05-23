@@ -1,0 +1,2 @@
+# Generalizable-and-Explainable-Deep-Learning-Architecture-for-Race-Classification-from-Facial-Images
+In data preprocessing, the input face image is resized to 224×224. The pre-trained MobileNetV3-Large backbone extracts multi-scale facial features, and a custom classification head classifies different races. Grad-CAM overlays activation maps on the original image to highlight the facial areas that influence each prediction.
