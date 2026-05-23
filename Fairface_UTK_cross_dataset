@@ -1,0 +1,296 @@
+# ============================================
+# STEP 1: Imports
+# ============================================
+import os
+import numpy as np
+import tensorflow as tf
+from tensorflow.keras.preprocessing.image import ImageDataGenerator
+from tensorflow.keras.applications import MobileNetV3Large
+from tensorflow.keras.applications.mobilenet_v3 import preprocess_input
+from tensorflow.keras.layers import Dense, GlobalAveragePooling2D, Dropout, BatchNormalization
+from tensorflow.keras.models import Model
+from tensorflow.keras.optimizers import SGD    
+from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint, ReduceLROnPlateau
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.metrics import classification_report, confusion_matrix, balanced_accuracy_score, recall_score
+from sklearn.utils.class_weight import compute_class_weight
+
+# ============================================
+# STEP 2: Paths
+# ============================================
+train_dir = "/home/kunj.bihari/Priyanka/Fairface 4_Race Dataset/Fairface organized 4_race/Train"
+val_dir   = "/home/kunj.bihari/Priyanka/Fairface 4_Race Dataset/Fairface organized 4_race/Val"
+
+# ============================================
+# STEP 2.5: Define UTKFace-compatible Class Mapping
+# ============================================
+DESIRED_CLASS_ORDER = ['White', 'Black', 'Asian', 'Indian']
+
+FOLDER_TO_DESIRED_MAPPING = {
+    'White': 'White', 'Black': 'Black', 'Asian': 'Asian', 'Indian': 'Indian',
+    'white': 'White', 'black': 'Black', 'asian': 'Asian', 'indian': 'Indian'
+}
+
+# ============================================
+# STEP 3: Custom Data Generator with Fixed Class Order
+# ============================================
+def create_generator_with_mapping(directory, target_size, batch_size, is_training=True):
+    existing_folders = [f for f in DESIRED_CLASS_ORDER if os.path.isdir(os.path.join(directory, f))]
+    missing_folders = [f for f in DESIRED_CLASS_ORDER if f not in existing_folders]
+    
+    if missing_folders:
+        print(f"⚠️ Warning: These classes are missing in {directory}: {missing_folders}")
+    
+    if is_training:
+        datagen = ImageDataGenerator(
+            preprocessing_function=preprocess_input,
+            rotation_range=25,
+            width_shift_range=0.2,
+            height_shift_range=0.2,
+            shear_range=0.2,
+            zoom_range=0.2,
+            horizontal_flip=True,
+            brightness_range=[0.8, 1.2],
+            fill_mode='nearest'
+        )
+    else:
+        datagen = ImageDataGenerator(preprocessing_function=preprocess_input)
+    
+    generator = datagen.flow_from_directory(
+        directory,
+        target_size=target_size,
+        batch_size=batch_size,
+        class_mode='categorical',
+        classes=existing_folders,
+        shuffle=is_training
+    )
+    
+    print(f"✅ Generator created for {directory} with classes: {existing_folders}")
+    return generator
+
+# ============================================
+# STEP 3.5: Create Generators
+# ============================================
+print("\n" + "="*70)
+print("CREATING DATA GENERATORS WITH UTKFACE-COMPATIBLE MAPPING")
+print("="*70)
+print("Desired mapping: White(0), Black(1), Asian(2), Indian(3)")
+
+train_gen = create_generator_with_mapping(
+    train_dir, 
+    target_size=(224, 224), 
+    batch_size=32, 
+    is_training=True
+)
+
+val_gen = create_generator_with_mapping(
+    val_dir, 
+    target_size=(224, 224), 
+    batch_size=32, 
+    is_training=False
+)
+
+# ============================================
+# STEP 3.6: Class Distribution and Weights
+# ============================================
+print("\n" + "="*70)
+print("CLASS DISTRIBUTION")
+print("="*70)
+
+class_names = DESIRED_CLASS_ORDER
+class_counts = np.bincount(train_gen.classes)
+total_samples = len(train_gen.classes)
+
+for i, class_name in enumerate(class_names):
+    count = class_counts[i] if i < len(class_counts) else 0
+    percentage = (count / total_samples) * 100
+    print(f"  {class_name} (index {i}): {count} images ({percentage:.2f}%)")
+
+# Calculate class weights
+class_weights = compute_class_weight(
+    class_weight='balanced',
+    classes=np.unique(train_gen.classes),
+    y=train_gen.classes
+)
+class_weight_dict = dict(enumerate(class_weights))
+
+print("\n⚖️ Class Weights:")
+for i, class_name in enumerate(class_names):
+    weight = class_weights[i]
+    print(f"  {class_name} (index {i}): weight = {weight:.4f}")
+
+# ============================================
+# STEP 4: Build Model with BLOCK-WISE FREEZING (Phase 1)
+# ============================================
+print("\n" + "="*70)
+print("BUILDING MOBILENETV3LARGE MODEL WITH BLOCK-WISE FREEZING (PHASE 1)")
+print("="*70)
+
+base_model = MobileNetV3Large(
+    include_top=False,
+    weights='imagenet',
+    input_shape=(224, 224, 3)
+)
+
+# ============================================
+# BLOCK-WISE FREEZING STRATEGY
+# ============================================
+block_names = ['expanded_conv'] + [f'expanded_conv_{i}' for i in range(1, 15)]
+
+blocks_to_freeze = 11  # First 11 blocks frozen
+trainable_blocks = 4   # Last 4 blocks trainable
+
+# Apply freezing
+for layer in base_model.layers:
+    layer_name = layer.name
+    # Freeze first 11 blocks
+    freeze = False
+    for block_name in block_names[:blocks_to_freeze]:
+        if layer_name.startswith(block_name):
+            layer.trainable = False
+            freeze = True
+            break
+    if not freeze:
+        layer.trainable = True
+
+# ============================================
+# STEP 4.5: Add Custom Classification Head
+# ============================================
+x = GlobalAveragePooling2D()(base_model.output)
+x = Dense(512, activation='relu', name='dense_1')(x)
+x = BatchNormalization(name='bn_1')(x)
+x = Dropout(0.5, name='dropout_1')(x)
+x = Dense(128, activation='relu', name='dense_2')(x)
+x = BatchNormalization(name='bn_2')(x)
+x = Dropout(0.3, name='dropout_2')(x)
+output = Dense(4, activation='softmax', name='race_output')(x)
+
+model = Model(inputs=base_model.input, outputs=output)
+
+# Ensure custom head layers are trainable
+for layer in model.layers:
+    if layer.name.startswith(('dense', 'bn', 'dropout', 'race_output')):
+        layer.trainable = True
+
+# ============================================
+# STEP 5: Compile Model
+# ============================================
+optimizer = SGD(learning_rate=1e-3, momentum=0.9, nesterov=True)
+model.compile(optimizer=optimizer, loss='categorical_crossentropy', metrics=['accuracy'])
+
+# ============================================
+# STEP 6: Callbacks
+# ============================================
+early_stop = EarlyStopping(monitor='val_accuracy', patience=10, restore_best_weights=True, verbose=1)
+checkpoint = ModelCheckpoint("mobilenetv3_best_sgd.h5", monitor='val_accuracy', save_best_only=True, verbose=1)
+reduce_lr = ReduceLROnPlateau(monitor='val_loss', patience=5, factor=0.5, min_lr=1e-5, verbose=1)
+
+# ============================================
+# STEP 7: Train Model (Phase 1: Transfer Learning)
+# ============================================
+history = model.fit(
+    train_gen,
+    validation_data=val_gen,
+    epochs=100,
+    callbacks=[early_stop, checkpoint, reduce_lr],
+    class_weight=class_weight_dict,
+    verbose=1
+)
+
+# ============================================
+# STEP 8: Evaluate Model (Before Fine-Tuning)
+# ============================================
+val_gen.reset()
+preds = model.predict(val_gen, verbose=1)
+y_pred = np.argmax(preds, axis=1)
+y_true = val_gen.classes
+
+print(classification_report(y_true, y_pred, target_names=class_names, digits=4))
+
+cm = confusion_matrix(y_true, y_pred)
+plt.figure(figsize=(8,6))
+sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
+            xticklabels=class_names, yticklabels=class_names)
+plt.xlabel('Predicted Label')
+plt.ylabel('True Label')
+plt.title('Confusion Matrix (Phase 1)')
+plt.show()
+
+# ============================================
+# STEP 9: Plot Training Curves
+# ============================================
+plt.figure(figsize=(12,5))
+plt.subplot(1,2,1)
+plt.plot(history.history['accuracy'], label='Train Accuracy')
+plt.plot(history.history['val_accuracy'], label='Val Accuracy')
+plt.legend()
+plt.grid(True)
+
+plt.subplot(1,2,2)
+plt.plot(history.history['loss'], label='Train Loss')
+plt.plot(history.history['val_loss'], label='Val Loss')
+plt.legend()
+plt.grid(True)
+plt.show()
+
+# ============================================
+# STEP 10: Fine-Tuning Phase (Phase 2)
+# ============================================
+for layer in model.layers:
+    layer.trainable = True
+
+optimizer_finetune = SGD(learning_rate=1e-4, momentum=0.9, nesterov=True)
+model.compile(optimizer=optimizer_finetune, loss='categorical_crossentropy', metrics=['accuracy'])
+
+fine_tune_history = model.fit(
+    train_gen,
+    validation_data=val_gen,
+    epochs=30,
+    callbacks=[early_stop, checkpoint, reduce_lr],
+    class_weight=class_weight_dict,
+    verbose=1
+)
+
+# ============================================
+# STEP 11: Save & Final Evaluation
+# ============================================
+model.save("mobilenetv3_fairface_finetuned_sgd.h5")
+
+val_gen.reset()
+final_preds = model.predict(val_gen, verbose=1)
+final_y_pred = np.argmax(final_preds, axis=1)
+
+print(classification_report(y_true, final_y_pred, target_names=class_names, digits=4))
+final_balanced_acc = balanced_accuracy_score(y_true, final_y_pred)
+print(f"Final Balanced Accuracy: {final_balanced_acc:.4f}")
+
+per_class_acc = recall_score(y_true, final_y_pred, average=None)
+for i, class_name in enumerate(class_names):
+    print(f"  {class_name}: {per_class_acc[i]:.4f}")
+
+disparity = np.max(per_class_acc) - np.min(per_class_acc)
+print(f"Disparity (Best - Worst): {disparity:.4f}")
+
+final_cm = confusion_matrix(y_true, final_y_pred)
+plt.figure(figsize=(8,6))
+sns.heatmap(final_cm, annot=True, fmt='d', cmap='Greens',
+            xticklabels=class_names, yticklabels=class_names)
+plt.title('Final Confusion Matrix')
+plt.show()
+
+# ============================================
+# STEP 12: Summary
+# ============================================
+print("\n" + "="*70)
+print("TRAINING SUMMARY")
+print("="*70)
+print(f"Phase 1: First 11 blocks frozen, last 4 blocks + custom head trainable")
+print(f"Phase 2: All layers trainable (fine-tuning)")
+print(f"Class Mapping: {class_names}")
+print(f"Class Weights Used: {class_weight_dict}")
+print(f"Final Accuracy: {np.mean(final_y_pred == y_true):.4f}")
+print(f"Final Balanced Accuracy: {final_balanced_acc:.4f}")
+print(f"Disparity (Best - Worst): {disparity:.4f}")
+print("="*70)
+print("Model saved as: mobilenetv3_fairface_finetuned_sgd.h5")
